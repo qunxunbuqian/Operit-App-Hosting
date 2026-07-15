@@ -1,0 +1,17 @@
+{
+  "daemonRunning": true,
+  "defaultPassword": "1784",
+  "apps": {
+    "com.xingin.xhs": {
+      "appName": "小红书",
+      "mode": "timer",
+      "duration": 15,
+      "unlockDelay": 0,
+      "enableAutoUnlock": false,
+      "active": true,
+      "lockStartTime": 0,
+      "startTime": 0,
+      "unlockTime": null
+    }
+  }
+}
