@@ -115,16 +115,31 @@
                  }
              ]
          },
-         {
-             "name": "app_lock_reset_config",
-             "description": {
-                 "zh": "将应用锁配置重置为默认值（空应用列表，默认密码 1784）。重置后需调用 app_lock_restart。",
-                 "en": "Reset the App Lock config to defaults (empty app list, default password 1784). Call app_lock_restart afterwards."
-             },
-             "parameters": []
-         }
-     ]
- }*/
+          {
+              "name": "app_lock_reset_config",
+              "description": {
+                  "zh": "将应用锁配置重置为默认值（空应用列表，默认密码 1784）。重置后需调用 app_lock_restart。",
+                  "en": "Reset the App Lock config to defaults (empty app list, default password 1784). Call app_lock_restart afterwards."
+              },
+              "parameters": []
+          },
+          {
+              "name": "app_lock_unlock",
+              "description": {
+                  "zh": "AI 远程解锁指定应用。将应用状态重置（active=false, mode=timer），守护脚本检测后立即关闭锁屏浮窗。不需要重启脚本，不影响其他被锁应用。",
+                  "en": "Remotely unlock a specific app. Resets app state (active=false, mode=timer); daemon detects and closes the lock overlay immediately. No restart needed, other locked apps unaffected."
+              },
+              "parameters": [
+                  {
+                      "name": "appPackage",
+                      "description": { "zh": "要解锁的应用包名（必需），例如 com.xingin.xhs", "en": "App package name to unlock (required), e.g. com.xingin.xhs." },
+                      "type": "string",
+                      "required": true
+                  }
+              ]
+          }
+      ]
+  }*/
 const appLockPackage = (function () {
     const CONFIG_PATH = "/sdcard/Download/app_lock/config.json";
     const DEFAULT_SCRIPT_PATH = "/sdcard/脚本/app_lock_v11.js";
@@ -164,6 +179,9 @@ const appLockPackage = (function () {
         return masked;
     }
 
+    /**
+     * 读取当前应用锁完整配置
+     */
     async function app_lock_get_config() {
         try {
             const config = await readConfig();
@@ -195,10 +213,14 @@ const appLockPackage = (function () {
         }
     }
 
+    /**
+     * 修改应用锁配置
+     */
     async function app_lock_edit_config(params) {
         try {
             const config = await readConfig();
 
+            // ★ v1.4: 暗门通道——从临时文件读取密码，读后即焚，避免调用参数暴露明文
             const PW_FILE = "/sdcard/Download/.app_lock_pw";
             if (params.loadPasswordFromFile === "true") {
                 try {
@@ -207,20 +229,26 @@ const appLockPackage = (function () {
                     if (pwFromFile) {
                         params.defaultPassword = pwFromFile;
                     }
+                    // 读后即焚
                     await Tools.Files.delete(PW_FILE).catch(function(){});
-                } catch (e) {}
+                } catch (e) {
+                    // 文件不存在或读取失败，静默忽略
+                }
             }
 
+            // 改默认密码
             if (params.defaultPassword !== undefined && params.defaultPassword !== "") {
                 config.defaultPassword = params.defaultPassword;
             }
 
+            // 删除应用
             if (params.remove === "true" && params.appPackage) {
                 if (config.apps && config.apps[params.appPackage]) {
                     const removedName = config.apps[params.appPackage].appName;
                     delete config.apps[params.appPackage];
                     await writeConfig(config);
                     
+                    // ★ v1.1: 自动重启脚本让配置生效
                     let restartInfo = null;
                     if (params.autoRestart !== "false") {
                         try {
@@ -247,6 +275,7 @@ const appLockPackage = (function () {
                 }
             }
 
+            // 新增或修改应用
             if (params.appPackage) {
                 if (!config.apps) {
                     config.apps = {};
@@ -254,21 +283,26 @@ const appLockPackage = (function () {
 
                 const existing = config.apps[params.appPackage] || {};
 
+                // ★ v1.2: 处理 enableAutoUnlock 开关 —— 优先级：unlockDelay 显式传入 > enableAutoUnlock > 已有值
                 let finalUnlockDelay;
                 let finalEnableAutoUnlock;
 
                 if (params.unlockDelay !== undefined) {
+                    // unlockDelay 显式传入，以它为准
                     finalUnlockDelay = parseInt(params.unlockDelay, 10);
                     finalEnableAutoUnlock = finalUnlockDelay > 0;
                 } else if (params.enableAutoUnlock !== undefined) {
+                    // 只传了 enableAutoUnlock，没有传 unlockDelay
                     if (params.enableAutoUnlock === "false") {
                         finalUnlockDelay = 0;
                         finalEnableAutoUnlock = false;
                     } else {
+                        // enableAutoUnlock=true：保持已有的 unlockDelay，或默认 60
                         finalUnlockDelay = (existing.unlockDelay !== undefined) ? existing.unlockDelay : 60;
                         finalEnableAutoUnlock = true;
                     }
                 } else {
+                    // 都没传，保留已有值
                     finalUnlockDelay = (existing.unlockDelay !== undefined) ? existing.unlockDelay : 60;
                     finalEnableAutoUnlock = (existing.enableAutoUnlock !== undefined) ? existing.enableAutoUnlock : (finalUnlockDelay > 0);
                 }
@@ -290,6 +324,7 @@ const appLockPackage = (function () {
 
                 await writeConfig(config);
 
+                // ★ v1.1: 自动重启脚本让配置生效
                 let restartInfo = null;
                 if (params.autoRestart !== "false") {
                     try {
@@ -310,8 +345,10 @@ const appLockPackage = (function () {
                 };
             }
 
+            // 只改了默认密码
             await writeConfig(config);
             
+            // ★ v1.1: 自动重启
             let restartInfo = null;
             if (params.autoRestart !== "false") {
                 try {
@@ -335,19 +372,26 @@ const appLockPackage = (function () {
         }
     }
 
+    /**
+     * 重启 AutoJS6 应用锁脚本
+     * v1.1: 先 force-stop 清旧进程，再用带 confirm extra 的 intent 启动
+     */
     async function app_lock_restart(params) {
         try {
             const scriptPath = params.scriptPath || DEFAULT_SCRIPT_PATH;
             const pkgName = "org.autojs.autojs6";
 
+            // 1) 强制停止 AutoJS6（杀掉旧守护进程）
             let killResult;
             try {
                 killResult = await Tools.System.shell("am force-stop " + pkgName + " 2>&1");
+                // 短暂等待进程退出
                 await new Promise(r => setTimeout(r, 600));
             } catch (e) {
                 killResult = { output: "force-stop skipped: " + e.message };
             }
 
+            // 2) 用带 confirm=true extra 的 intent 启动（部分 AutoJS6 版本支持直接运行）
             const startCmd = 'am start -a android.intent.action.VIEW ' +
                 '-d "file://' + scriptPath + '" ' +
                 '-t "application/x-javascript" ' +
@@ -381,6 +425,9 @@ const appLockPackage = (function () {
         }
     }
 
+    /**
+     * 重置配置为默认值
+     */
     async function app_lock_reset_config() {
         try {
             const config = JSON.parse(JSON.stringify(DEFAULT_CONFIG));
@@ -396,11 +443,63 @@ const appLockPackage = (function () {
         }
     }
 
+    /**
+     * ★ v1.5: AI 远程解锁指定应用
+     *   不改动其他应用的状态，不重启脚本。
+     *   写入 _unlockFlag 让守护脚本即时检测并关闭浮窗。
+     */
+    async function app_lock_unlock(params) {
+        try {
+            if (!params.appPackage) {
+                return { success: false, error: "缺少必填参数 appPackage" };
+            }
+
+            const config = await readConfig();
+            if (!config.apps || !config.apps[params.appPackage]) {
+                return {
+                    success: false,
+                    error: "应用 " + params.appPackage + " 不在配置中，无需解锁"
+                };
+            }
+
+            const appName = config.apps[params.appPackage].appName || params.appPackage;
+            const wasLocked = config.apps[params.appPackage].mode === "locked";
+
+            // 重置应用状态
+            config.apps[params.appPackage].active = false;
+            config.apps[params.appPackage].mode = "timer";
+            config.apps[params.appPackage].startTime = 0;
+            config.apps[params.appPackage].lockStartTime = 0;
+            config.apps[params.appPackage].unlockTime = null;
+
+            // ★ v1.5: 写入解锁标志，守护脚本优先检测此字段即时关闭浮窗
+            config._unlockFlag = {
+                pkg: params.appPackage,
+                time: Math.floor(Date.now() / 1000)
+            };
+
+            await writeConfig(config);
+
+            return {
+                success: true,
+                action: "unlocked",
+                package: params.appPackage,
+                appName: appName,
+                wasLocked: wasLocked,
+                hint: "已解锁 " + appName + "。守护脚本将在下一个心跳（≤500ms）检测并关闭锁屏浮窗。"
+            };
+        } catch (e) {
+            console.error("[app_lock_unlock] 错误:", e.message);
+            return { success: false, error: e.message };
+        }
+    }
+
     return {
         app_lock_get_config: app_lock_get_config,
         app_lock_edit_config: app_lock_edit_config,
         app_lock_restart: app_lock_restart,
-        app_lock_reset_config: app_lock_reset_config
+        app_lock_reset_config: app_lock_reset_config,
+        app_lock_unlock: app_lock_unlock
     };
 })();
 
@@ -408,3 +507,4 @@ exports.app_lock_get_config = appLockPackage.app_lock_get_config;
 exports.app_lock_edit_config = appLockPackage.app_lock_edit_config;
 exports.app_lock_restart = appLockPackage.app_lock_restart;
 exports.app_lock_reset_config = appLockPackage.app_lock_reset_config;
+exports.app_lock_unlock = appLockPackage.app_lock_unlock;
